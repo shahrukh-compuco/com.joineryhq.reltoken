@@ -51,50 +51,67 @@ function _reltoken_register_tokens(\Civi\Token\Event\TokenRegisterEvent $e) {
  */
 function _reltoken_evaluate_tokens(\Civi\Token\Event\TokenValueEvent $e) {
   $tokens = $e->getTokenProcessor()->getMessageTokens();
-  $contactIDs = $e->getTokenProcessor()->getContextValues('contactId');
-  if (!empty($tokens['related'])) {
-    $schema = ['contactId'];
+  if (empty($tokens['related'])) {
+    return;
+  }
 
-    foreach ($tokens['related'] as $token) {
-      if (strpos($token, '___reltype_')) {
-        $relatedContactIDsPerContact = _reltoken_get_related_contact_ids_per_contact($contactIDs, $token);
-        $relatedContactIDs = array_unique(array_values($relatedContactIDsPerContact));
-        // If you're using a token for a relationship this person doesn't have, just skip it
-        // Otherwise you create a query that crushes the system.
-        if (!$relatedContactIDs) {
-          continue;
-        }
-        $baseToken = preg_replace('/^(.+)___reltype_.+$/', '$1', $token);
+  // Build a proper rowId -> contactId map by reading each row's context
+  // directly.
+  $originalRowCids = [];
+  foreach ($e->getRows() as $originalRowKey => $originalRow) {
+    $originalRowCids[$originalRowKey] = $originalRow->context['contactId'] ?? NULL;
+  }
+  $contactIDs = array_values(array_unique(array_filter($originalRowCids)));
+  if (empty($contactIDs)) {
+    return;
+  }
 
-        $useSmarty = (bool) (defined('CIVICRM_MAIL_SMARTY') && CIVICRM_MAIL_SMARTY);
-        $relatedTokenProcessor = new \Civi\Token\TokenProcessor(\Civi::dispatcher(), [
-          'controller' => __CLASS__,
-          'schema' => $schema,
-          'smarty' => $useSmarty,
-        ]);
-        $relatedTokenProcessor->addMessage($baseToken, '{contact.' . $baseToken . '}', 'text/plain');
-        foreach ($relatedContactIDs as $cid) {
-          $relatedTokenProcessor->addRow(['contactId' => $cid]);
-        }
-        $relatedTokenProcessor->evaluate();
-        // Get the contact IDs of both token processors, figure out which rows
-        // in the original token processor should get new values.
-        $relatedTokenProcessorCidToRowMap = array_flip($relatedTokenProcessor->getContextValues('contactId'));
-        $originalTokenProcessorContext = $e->getTokenProcessor()->getContextValues('contactId');
-        foreach ($relatedContactIDs as $rowId => $cid) {
-          $renderedToken[$cid] = $relatedTokenProcessor->getRow($rowId)->render($baseToken);
-        }
+  $schema = ['contactId'];
 
-        // Go through each of the original rows.  Check if this contact has a related
-        // contact matching this token. If so, render the reltoken and add it tos
-        // the original row.
-        foreach ($e->getRows() as $originalRowKey => $originalRow) {
-          $originalRowCid = $originalTokenProcessorContext[$originalRowKey];
-          $relatedContactId = ($relatedContactIDsPerContact[$originalRowCid] ?? NULL);
-          if ($relatedContactId) {
-            $originalRow->tokens('related', $token, $renderedToken[$relatedContactId]);
-          }
-        }
+  foreach ($tokens['related'] as $token) {
+    if (strpos($token, '___reltype_') === FALSE) {
+      continue;
+    }
+
+    $relatedContactIDsPerContact = _reltoken_get_related_contact_ids_per_contact($contactIDs, $token);
+    if (empty($relatedContactIDsPerContact)) {
+      continue;
+    }
+
+    $relatedContactIDs = array_values(array_unique(array_filter($relatedContactIDsPerContact)));
+    if (empty($relatedContactIDs)) {
+      continue;
+    }
+
+    $baseToken = preg_replace('/^(.+)___reltype_.+$/', '$1', $token);
+
+    $useSmarty = (bool) (defined('CIVICRM_MAIL_SMARTY') && CIVICRM_MAIL_SMARTY);
+    $relatedTokenProcessor = new \Civi\Token\TokenProcessor(\Civi::dispatcher(), [
+      'controller' => __CLASS__,
+      'schema' => $schema,
+      'smarty' => $useSmarty,
+    ]);
+    $relatedTokenProcessor->addMessage($baseToken, '{contact.' . $baseToken . '}', 'text/plain');
+    $relatedCidToRowId = [];
+    foreach ($relatedContactIDs as $cid) {
+      $row = $relatedTokenProcessor->addRow(['contactId' => $cid]);
+      $relatedCidToRowId[$cid] = $row->tokenRow;
+    }
+    $relatedTokenProcessor->evaluate();
+
+    // Render each unique related contact's token value exactly once.
+    $renderedTokens = [];
+    foreach ($relatedCidToRowId as $cid => $rowId) {
+      $renderedTokens[$cid] = $relatedTokenProcessor->getRow($rowId)->render($baseToken);
+    }
+    foreach ($e->getRows() as $originalRowKey => $originalRow) {
+      $originalRowCid = $originalRowCids[$originalRowKey] ?? NULL;
+      if (!$originalRowCid) {
+        continue;
+      }
+      $relatedContactId = $relatedContactIDsPerContact[$originalRowCid] ?? NULL;
+      if ($relatedContactId !== NULL && isset($renderedTokens[$relatedContactId])) {
+        $originalRow->tokens('related', $token, $renderedTokens[$relatedContactId]);
       }
     }
   }
